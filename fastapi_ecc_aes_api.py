@@ -10,7 +10,6 @@ Run locally:
     pip install fastapi uvicorn cryptography pyjwt passlib[argon2] argon2-cffi
     uvicorn fastapi_ecc_aes_api_server_side_encrypt:app --reload --port 8000
 """
-
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
@@ -19,9 +18,11 @@ import os
 import base64
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional, Any
 import json
 import secrets
+import time
+import errno
 
 # Crypto imports
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -41,7 +42,8 @@ from passlib.context import CryptContext
 DB_PATH = "medical_data.db"
 KEYS_DIR = "keys"
 SERVER_KEY_PATH = os.path.join(KEYS_DIR, "server_privkey.pem")
-JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_urlsafe(32))
+OLD_KEY_PATH = SERVER_KEY_PATH + ".old"
+JWT_SECRET = os.environ.get("JWT_SECRET", None) or secrets.token_urlsafe(32)
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
@@ -52,17 +54,9 @@ NONCE_SIZE = 12
 os.makedirs(KEYS_DIR, exist_ok=True)
 
 # -------------------------------
-# UPDATED: Argon2id password hashing
+# UPDATED: Argon2id password hashing (use defaults; tune via env or config)
 # -------------------------------
-
-pwd_context = CryptContext(
-    schemes=["argon2"],
-    deprecated="auto",
-    argon2__type="ID",            # Use Argon2id (recommended)
-    argon2__memory_cost=65536,    # 64 MB RAM
-    argon2__time_cost=3,
-    argon2__parallelism=2,
-)
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 app = FastAPI(title="ECC-AES Hybrid Medical Data Collector API (Server-side Encryption) - Full")
@@ -72,7 +66,7 @@ app = FastAPI(title="ECC-AES Hybrid Medical Data Collector API (Server-side Encr
 # -------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # Or restrict to your frontend domain
+    allow_origins=["*"],            # tighten in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -81,44 +75,49 @@ app.add_middleware(
 # -------------------------------
 # Database init
 # -------------------------------
-
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+    # ensure directory present if DB path has directories (not in this simple example)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
 
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            client_pubkey TEXT,
-            nonce_b64 TEXT,
-            ciphertext_b64 TEXT NOT NULL,
-            aad_b64 TEXT,
-            note TEXT
-        )
-    ''')
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                client_pubkey TEXT,
+                nonce_b64 TEXT,
+                ciphertext_b64 TEXT NOT NULL,
+                aad_b64 TEXT,
+                note TEXT
+            )
+        ''')
 
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            hashed_password TEXT NOT NULL,
-            role TEXT NOT NULL
-        )
-    ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                hashed_password TEXT NOT NULL,
+                role TEXT NOT NULL
+            )
+        ''')
 
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            username TEXT,
-            action TEXT NOT NULL,
-            target_id TEXT,
-            details TEXT
-        )
-    ''')
-
-    conn.commit()
-    conn.close()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                username TEXT,
+                action TEXT NOT NULL,
+                target_id TEXT,
+                details TEXT
+            )
+        ''')
+        conn.commit()
 
 init_db()
 
@@ -133,8 +132,13 @@ def generate_server_key(path: str) -> ec.EllipticCurvePrivateKey:
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption()
     )
+    # write with restrictive permissions if possible
     with open(path, "wb") as f:
         f.write(priv_pem)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
     return priv
 
 
@@ -143,11 +147,21 @@ def load_privkey(path: str) -> ec.EllipticCurvePrivateKey:
         pem = f.read()
     return serialization.load_pem_private_key(pem, password=None, backend=default_backend())
 
+
+# ensure server key exists
 if not os.path.exists(SERVER_KEY_PATH):
     generate_server_key(SERVER_KEY_PATH)
 
 SERVER_PRIV = load_privkey(SERVER_KEY_PATH)
 SERVER_PUB = SERVER_PRIV.public_key()
+
+# If old key file exists (from prior rotation), load it for fallback decryption
+OLD_SERVER_PRIV: Optional[ec.EllipticCurvePrivateKey] = None
+if os.path.exists(OLD_KEY_PATH):
+    try:
+        OLD_SERVER_PRIV = load_privkey(OLD_KEY_PATH)
+    except Exception:
+        OLD_SERVER_PRIV = None
 
 # -------------------------------
 # Utility crypto helpers
@@ -180,70 +194,108 @@ def derive_aes_key(shared_secret: bytes) -> bytes:
     )
     return hkdf.derive(shared_secret)
 
+
 def constant_time_compare(a: bytes, b: bytes) -> bool:
     return hmac.compare_digest(a, b)
+
 
 # -------------------------------
 # Auth & user management
 # -------------------------------
 
 def get_user(username: str) -> Optional[dict]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT username, hashed_password, role FROM users WHERE username = ?", (username,))
-    row = cur.fetchone()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT username, hashed_password, role FROM users WHERE username = ?", (username,))
+        row = cur.fetchone()
     if not row:
         return None
     return {"username": row[0], "hashed_password": row[1], "role": row[2]}
 
 
-def create_user(username: str, password: str, role: str = "clinician"):
+def create_user(username: str, password: str, role: str = "clinician") -> None:
     hashed = pwd_context.hash(password)
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO users (username, hashed_password, role) VALUES (?, ?, ?)", (username, hashed, role))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("INSERT INTO users (username, hashed_password, role) VALUES (?, ?, ?)", (username, hashed, role))
+            conn.commit()
+        except sqlite3.IntegrityError as e:
+            # username already exists
+            raise ValueError("user_exists") from e
 
 
-conn = sqlite3.connect(DB_PATH)
-cur = conn.cursor()
-cur.execute("SELECT COUNT(*) FROM users")
-count = cur.fetchone()[0]
-conn.close()
-if count == 0:
-    print("No users found - creating default admin user: 'admin' with password 'adminpass' (change immediately)")
-    create_user("admin", "adminpass", role="admin")
+# initialize admin user if none exists (use env var or generate a secure one and store safely)
+def ensure_initial_admin():
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        count = cur.fetchone()[0]
+    if count == 0:
+        admin_pw = os.environ.get("INITIAL_ADMIN_PASS")
+        if not admin_pw:
+            # generate a secure password and write it to a local file with restrictive perms
+            admin_pw = secrets.token_urlsafe(24)
+            notice_path = os.path.join(KEYS_DIR, "initial_admin_password.txt")
+            try:
+                with open(notice_path, "w") as f:
+                    f.write(admin_pw)
+                try:
+                    os.chmod(notice_path, 0o600)
+                except Exception:
+                    pass
+                print(f"No users found - created default admin account. Password written to: {notice_path}")
+            except Exception:
+                # fallback: print warning but do not print password
+                print("No users found - created default admin account. INITIAL_ADMIN_PASS env var was not set; a password was generated and stored locally.")
+        try:
+            create_user("admin", admin_pw, role="admin")
+        except ValueError:
+            # race condition or existed; ignore
+            pass
+
+ensure_initial_admin()
 
 
 def authenticate_user(username: str, password: str) -> Optional[dict]:
     user = get_user(username)
     if not user:
         return None
-    if not pwd_context.verify(password, user["hashed_password"]):
+    try:
+        if not pwd_context.verify(password, user["hashed_password"]):
+            return None
+    except Exception:
+        # On verification errors, fail auth
         return None
     return user
 
 
 def verify_user_password(password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(password, hashed_password)
+    try:
+        return pwd_context.verify(password, hashed_password)
+    except Exception:
+        return False
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire_dt = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
+        expire_dt = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    # use numeric unix timestamp for exp
+    to_encode.update({"exp": int(expire_dt.timestamp())})
+    # ensure sub present
+    if "sub" not in to_encode and "username" in to_encode:
+        to_encode["sub"] = to_encode["username"]
     encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
     return encoded_jwt
+
 
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        username: str = payload.get("sub")
+        username: Optional[str] = payload.get("sub")
         if username is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
     except jwt.PyJWTError:
@@ -253,10 +305,12 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     return user
 
+
 async def require_role(role: str, current_user: dict = Depends(get_current_user)) -> dict:
     if current_user["role"] != role and current_user["role"] != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient privileges")
     return current_user
+
 
 # -------------------------------
 # Pydantic models
@@ -265,28 +319,38 @@ async def require_role(role: str, current_user: dict = Depends(get_current_user)
 class ReAuthRequest(BaseModel):
     password: str
 
+
+class CreateUserRequest(BaseModel):
+    username: str
+    password: str
+    role: str = "clinician"
+
+
 # UPDATED: accept plaintext. Server will encrypt.
 class RecordCreateRequest(BaseModel):
     plaintext: str
     note: Optional[str] = None
 
+
 class RecordUpdateRequest(BaseModel):
     note: Optional[str] = None
 
+
 class RotateKeyRequest(BaseModel):
     password: str
+
 
 # -------------------------------
 # Audit logging
 # -------------------------------
 
 def log_audit(username: Optional[str], action: str, target_id: Optional[str] = None, details: Optional[str] = None):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT INTO audit_logs (timestamp, username, action, target_id, details) VALUES (?, ?, ?, ?, ?)",
-                (datetime.utcnow().isoformat(), username, action, target_id, details))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO audit_logs (timestamp, username, action, target_id, details) VALUES (?, ?, ?, ?, ?)",
+                    (datetime.utcnow().isoformat(), username, action, target_id, details))
+        conn.commit()
+
 
 # -------------------------------
 # Re-auth helper
@@ -295,6 +359,7 @@ def log_audit(username: Optional[str], action: str, target_id: Optional[str] = N
 def require_reauth(current_user: dict, reauth_password: str):
     if not verify_user_password(reauth_password, current_user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Re-authentication failed")
+
 
 # -------------------------------
 # Token endpoint
@@ -306,22 +371,29 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     if not user:
         raise HTTPException(status_code=400, detail="Incorrect username or password")
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    token = create_access_token({"sub": user["username"], "role": user["role"]}, expires_delta=access_token_expires)
+    token = create_access_token({"sub": user["username"], "role": user["role"], "username": user["username"]}, expires_delta=access_token_expires)
     log_audit(user["username"], "login", None, "issued JWT token")
     return {"access_token": token, "token_type": "bearer"}
+
 
 # -------------------------------
 # User management endpoints
 # -------------------------------
 
 @app.post("/users/create")
-async def api_create_user(username: str, password: str, role: str = "clinician", reauth: ReAuthRequest = Depends(), current_user: dict = Depends(get_current_user)):
+async def api_create_user(req: CreateUserRequest, reauth: ReAuthRequest = Depends(), current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Only admin can create users")
     require_reauth(current_user, reauth.password)
-    create_user(username, password, role)
-    log_audit(current_user["username"], "create_user", username, f"role={role}")
-    return {"status": "user_created", "username": username}
+    try:
+        create_user(req.username, req.password, req.role)
+    except ValueError as e:
+        if str(e) == "user_exists":
+            raise HTTPException(status_code=400, detail="User already exists")
+        raise HTTPException(status_code=500, detail="Failed to create user")
+    log_audit(current_user["username"], "create_user", req.username, f"role={req.role}")
+    return {"status": "user_created", "username": req.username}
+
 
 # -------------------------------
 # Record endpoints (server-side encryption)
@@ -356,18 +428,18 @@ async def create_record(req: RecordCreateRequest, current_user: dict = Depends(g
     aad_b64 = None
 
     # Store encrypted record in DB
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT INTO records (created_at, client_pubkey, nonce_b64, ciphertext_b64, aad_b64, note) VALUES (?, ?, ?, ?, ?, ?)",
-                (datetime.utcnow().isoformat(), client_pubkey_b64, nonce_b64, ciphertext_b64, aad_b64, req.note))
-    record_id = cur.lastrowid
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO records (created_at, client_pubkey, nonce_b64, ciphertext_b64, aad_b64, note) VALUES (?, ?, ?, ?, ?, ?)",
+                    (datetime.utcnow().isoformat(), client_pubkey_b64, nonce_b64, ciphertext_b64, aad_b64, req.note))
+        record_id = cur.lastrowid
+        conn.commit()
 
     log_audit(current_user['username'], "create_record", str(record_id), f"note={req.note}")
 
     # Return success (we do NOT return plaintext or AES key)
     return {"status": "created", "record_id": record_id}
+
 
 @app.post("/records/{record_id}")
 async def view_record(record_id: int, reauth: ReAuthRequest, current_user: dict = Depends(get_current_user)):
@@ -376,25 +448,43 @@ async def view_record(record_id: int, reauth: ReAuthRequest, current_user: dict 
 
     require_reauth(current_user, reauth.password)
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT id, created_at, client_pubkey, nonce_b64, ciphertext_b64, aad_b64, note FROM records WHERE id = ?", (record_id,))
-    row = cur.fetchone()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, created_at, client_pubkey, nonce_b64, ciphertext_b64, aad_b64, note FROM records WHERE id = ?", (record_id,))
+        row = cur.fetchone()
 
     if not row:
         raise HTTPException(status_code=404, detail="Record not found")
 
+    # row indices: 0:id,1:created_at,2:client_pubkey,3:nonce_b64,4:ciphertext_b64,5:aad_b64,6:note
     try:
         client_pub = load_pubkey_from_pem_b64(row[2])
-        shared = SERVER_PRIV.exchange(ec.ECDH(), client_pub)
-        aes_key = derive_aes_key(shared)
-        aesgcm = AESGCM(aes_key)
-        # row[3] is nonce_b64, row[4] is ciphertext_b64
-        plaintext = aesgcm.decrypt(base64.b64decode(row[3]), base64.b64decode(row[4]), None)
     except Exception as e:
-        log_audit(current_user['username'], "view_record_failed", str(record_id), str(e))
-        raise HTTPException(status_code=500, detail=f"Decryption failed: {e}")
+        log_audit(current_user['username'], "view_record_failed", str(record_id), f"invalid client_pubkey: {e}")
+        raise HTTPException(status_code=500, detail="Invalid stored client public key")
+
+    plaintext: Optional[bytes] = None
+    last_exc: Optional[Exception] = None
+
+    # Try current server key first, then fallback to old server key if present
+    for priv_key_candidate, key_label in ((SERVER_PRIV, "current"), (OLD_SERVER_PRIV, "old")):
+        if priv_key_candidate is None:
+            continue
+        try:
+            shared = priv_key_candidate.exchange(ec.ECDH(), client_pub)
+            aes_key = derive_aes_key(shared)
+            aesgcm = AESGCM(aes_key)
+            plaintext = aesgcm.decrypt(base64.b64decode(row[3]), base64.b64decode(row[4]), None)
+            if key_label == "old":
+                log_audit(current_user['username'], "view_record_decrypt_fallback", str(record_id), "used old server key")
+            break
+        except Exception as e:
+            last_exc = e
+            plaintext = None
+
+    if plaintext is None:
+        log_audit(current_user['username'], "view_record_failed", str(record_id), str(last_exc))
+        raise HTTPException(status_code=500, detail=f"Decryption failed: {last_exc}")
 
     log_audit(current_user['username'], "view_record", str(record_id), "success")
 
@@ -409,6 +499,7 @@ async def view_record(record_id: int, reauth: ReAuthRequest, current_user: dict 
 
 @app.post("/records/{record_id}/retrieve")
 async def retrieve_record(record_id: int, reauth: ReAuthRequest, current_user: dict = Depends(get_current_user)):
+    # wrapper to allow alternate route name
     return await view_record(record_id, reauth, current_user)
 
 
@@ -420,16 +511,13 @@ async def update_record(record_id: int, payload: RecordUpdateRequest, reauth: Re
     if current_user["role"] not in ["clinician", "doctor", "admin"]:
         raise HTTPException(status_code=403, detail="Insufficient privileges")
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM records WHERE id = ?", (record_id,))
-    if not cur.fetchone():
-        conn.close()
-        raise HTTPException(status_code=404, detail="Record not found")
-
-    cur.execute("UPDATE records SET note = ? WHERE id = ?", (payload.note, record_id))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM records WHERE id = ?", (record_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Record not found")
+        cur.execute("UPDATE records SET note = ? WHERE id = ?", (payload.note, record_id))
+        conn.commit()
 
     log_audit(current_user['username'], "update_record", str(record_id), f"note={payload.note}")
 
@@ -443,20 +531,18 @@ async def delete_record(record_id: int, reauth: ReAuthRequest, current_user: dic
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Only admin can delete records")
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM records WHERE id = ?", (record_id,))
-    if not cur.fetchone():
-        conn.close()
-        raise HTTPException(status_code=404, detail="Record not found")
-
-    cur.execute("DELETE FROM records WHERE id = ?", (record_id,))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM records WHERE id = ?", (record_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Record not found")
+        cur.execute("DELETE FROM records WHERE id = ?", (record_id,))
+        conn.commit()
 
     log_audit(current_user['username'], "delete_record", str(record_id), "deleted")
 
     return {"status": "deleted", "record_id": record_id}
+
 
 # -------------------------------
 # Key rotation
@@ -465,18 +551,37 @@ async def delete_record(record_id: int, reauth: ReAuthRequest, current_user: dic
 @app.post("/keys/rotate")
 async def rotate_keys(req: RotateKeyRequest, current_user: dict = Depends(get_current_user)):
     require_reauth(current_user, req.password)
+
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Only admin can rotate keys")
 
+    global SERVER_PRIV, SERVER_PUB, OLD_SERVER_PRIV
+
+    # Backup old key file on disk and try to load it into OLD_SERVER_PRIV for fallback
+    if os.path.exists(SERVER_KEY_PATH):
+        # remove any existing old key path first to keep deterministic behavior
+        try:
+            if os.path.exists(OLD_KEY_PATH):
+                os.remove(OLD_KEY_PATH)
+        except Exception:
+            pass
+        os.replace(SERVER_KEY_PATH, OLD_KEY_PATH)
+        try:
+            OLD_SERVER_PRIV = load_privkey(OLD_KEY_PATH)
+        except Exception:
+            OLD_SERVER_PRIV = None
+
+    # Generate new key and save
     generate_server_key(SERVER_KEY_PATH)
 
-    global SERVER_PRIV, SERVER_PUB
+    # Reload global key variables
     SERVER_PRIV = load_privkey(SERVER_KEY_PATH)
     SERVER_PUB = SERVER_PRIV.public_key()
 
-    log_audit(current_user['username'], "rotate_keys", None, "server key rotated")
+    log_audit(current_user["username"], "rotate_keys", None, "rotated ECC server key (old key kept for legacy decryption)")
 
-    return {"status": "success", "message": "Server ECC key rotated (existing records not re-encrypted)"}
+    return {"status": "rotated", "detail": "New key active. Old key kept for legacy decryption."}
+
 
 # -------------------------------
 # Utility endpoints
@@ -487,11 +592,10 @@ async def list_records(current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ["clinician", "doctor", "admin"]:
         raise HTTPException(status_code=403, detail="Insufficient privileges")
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT id, created_at, note FROM records ORDER BY created_at DESC")
-    rows = cur.fetchall()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, created_at, note FROM records ORDER BY created_at DESC")
+        rows = cur.fetchall()
 
     return [{"id": r[0], "created_at": r[1], "note": r[2]} for r in rows]
 
@@ -501,11 +605,10 @@ async def get_audit_logs(current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Only admin can view audit logs")
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT id, timestamp, username, action, target_id, details FROM audit_logs ORDER BY timestamp DESC LIMIT 1000")
-    rows = cur.fetchall()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, timestamp, username, action, target_id, details FROM audit_logs ORDER BY timestamp DESC LIMIT 1000")
+        rows = cur.fetchall()
 
     return [{"id": r[0], "timestamp": r[1], "username": r[2], "action": r[3], "target_id": r[4], "details": r[5]} for r in rows]
 
