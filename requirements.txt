@@ -4,7 +4,7 @@ cryptography==42.0.5
 PyJWT==2.8.0
 passlib[argon2]==1.7.4
 argon2-cffi==23.1.0
-sqlite3-binary==0.0.1
+sqlite3-binary
 python-dotenv==1.0.1
 pydantic==1.10.14
 loguru==0.7.2
