@@ -14,6 +14,7 @@ Run locally:
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import base64
 import sqlite3
@@ -65,6 +66,17 @@ pwd_context = CryptContext(
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 app = FastAPI(title="ECC-AES Hybrid Medical Data Collector API (Server-side Encryption) - Full")
+
+# -------------------------------
+# CORS
+# -------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],            # Or restrict to your frontend domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -------------------------------
 # Database init

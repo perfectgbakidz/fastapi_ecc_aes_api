@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Panel - User Management</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f4f4f4;
+            color: #333;
+        }
+        .container {
+            max-width: 600px;
+            margin: auto;
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+        }
+        h2 {
+            color: #007bff;
+            border-bottom: 2px solid #007bff;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }
+        form div {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="text"], input[type="password"], select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #28a745;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #218838;
+        }
+        #message {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 4px;
+            display: none;
+        }
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .logged-in-info {
+            padding: 10px;
+            background-color: #e2f0fb;
+            border: 1px solid #b8daff;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🏥 ECC-AES Admin Panel</h1>
+
+        <div id="login-section">
+            <h2>Admin Login</h2>
+            <form id="login-form">
+                <div>
+                    <label for="login-username">Username:</label>
+                    <input type="text" id="login-username" required value="admin">
+                </div>
+                <div>
+                    <label for="login-password">Password:</label>
+                    <input type="password" id="login-password" required value="adminpass">
+                </div>
+                <button type="submit">Login</button>
+            </form>
+        </div>
+
+        <div id="create-user-section" style="display: none;">
+            <div class="logged-in-info">
+                Logged in as: <strong id="logged-in-user"></strong> (Role: <strong id="logged-in-role"></strong>)
+                <button onclick="logout()" style="float: right; background-color: #dc3545;">Logout</button>
+            </div>
+
+            <h2>Create New User</h2>
+            <form id="create-user-form">
+                <div>
+                    <label for="create-username">New Username:</label>
+                    <input type="text" id="create-username" required>
+                </div>
+                <div>
+                    <label for="create-password">New Password:</label>
+                    <input type="password" id="create-password" required>
+                </div>
+                <div>
+                    <label for="create-role">Role:</label>
+                    <select id="create-role" required>
+                        <option value="clinician">clinician</option>
+                        <option value="doctor">doctor</option>
+                        <option value="admin">admin</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="reauth-password">Admin Password (Re-Auth):</label>
+                    <input type="password" id="reauth-password" required>
+                    <small>Enter your **admin** password to confirm user creation.</small>
+                </div>
+                <button type="submit">Create User</button>
+            </form>
+        </div>
+
+        <div id="message"></div>
+    </div>
+
+    <script>
+        // Set the base API URL
+        const API_URL = "https://fastapi-ecc-aes-api.onrender.com";
+        let accessToken = null;
+        let currentUser = null;
+
+        const messageEl = document.getElementById('message');
+        const loginSection = document.getElementById('login-section');
+        const createUserSection = document.getElementById('create-user-section');
+        const loggedInUserEl = document.getElementById('logged-in-user');
+        const loggedInRoleEl = document.getElementById('logged-in-role');
+
+        /**
+         * Utility function to display messages
+         */
+        function showMessage(text, isError) {
+            messageEl.textContent = text;
+            messageEl.className = isError ? 'error' : 'success';
+            messageEl.style.display = 'block';
+        }
+
+        /**
+         * Handle Admin Login
+         */
+        document.getElementById('login-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            showMessage('Logging in...', false);
+            
+            const username = document.getElementById('login-username').value;
+            const password = document.getElementById('login-password').value;
+
+            // Form data for /token endpoint (requires application/x-www-form-urlencoded)
+            const formData = new URLSearchParams();
+            formData.append('username', username);
+            formData.append('password', password);
+
+            try {
+                const response = await fetch(`${API_URL}/token`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded'
+                    },
+                    body: formData.toString()
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    // Check if the user has admin role from the token's payload
+                    // Note: This relies on the JWT being structured as per your backend
+                    const payload = JSON.parse(atob(data.access_token.split('.')[1]));
+                    const role = payload.role;
+
+                    if (role !== 'admin') {
+                        throw new Error('User is not an Admin. Access Denied.');
+                    }
+
+                    accessToken = data.access_token;
+                    currentUser = username;
+
+                    // Update UI for logged-in admin
+                    loggedInUserEl.textContent = username;
+                    loggedInRoleEl.textContent = role;
+                    loginSection.style.display = 'none';
+                    createUserSection.style.display = 'block';
+                    showMessage(`Successfully logged in as ${username}.`, false);
+
+                } else {
+                    throw new Error(data.detail || 'Login failed.');
+                }
+            } catch (error) {
+                console.error("Login Error:", error);
+                showMessage(`Login Error: ${error.message}`, true);
+                accessToken = null;
+                currentUser = null;
+            }
+        });
+
+
+        /**
+         * Handle User Creation
+         */
+        document.getElementById('create-user-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            showMessage('Creating user...', false);
+
+            const newUsername = document.getElementById('create-username').value;
+            const newPassword = document.getElementById('create-password').value;
+            const newRole = document.getElementById('create-role').value;
+            const reauthPassword = document.getElementById('reauth-password').value;
+            
+            if (!accessToken) {
+                showMessage('Not logged in. Please log in first.', true);
+                return;
+            }
+
+            // The API uses a ReAuthRequest body for the reauth password
+            const reauthBody = JSON.stringify({ password: reauthPassword });
+            
+            // Note: FastAPI expects query parameters for username, password, role
+            // The ReAuthRequest (reauth) is sent as a JSON body *after* the query parameters
+            try {
+                const response = await fetch(`${API_URL}/users/create?username=${newUsername}&password=${newPassword}&role=${newRole}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${accessToken}`
+                    },
+                    body: reauthBody
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    showMessage(`User **${newUsername}** created successfully with role **${newRole}**.`, false);
+                    document.getElementById('create-user-form').reset();
+                    document.getElementById('reauth-password').value = ''; // Clear only reauth password
+                } else {
+                    throw new Error(data.detail || 'User creation failed.');
+                }
+            } catch (error) {
+                console.error("User Creation Error:", error);
+                showMessage(`User Creation Error: ${error.message}`, true);
+            }
+        });
+
+        /**
+         * Handle Logout
+         */
+        function logout() {
+            accessToken = null;
+            currentUser = null;
+            loginSection.style.display = 'block';
+            createUserSection.style.display = 'none';
+            document.getElementById('login-form').reset();
+            showMessage('Logged out successfully.', false);
+        }
+    </script>
+</body>
+</html>
