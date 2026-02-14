@@ -620,3 +620,13 @@ async def get_audit_logs(current_user: dict = Depends(get_current_user)):
 @app.get("/keys/server_pub")
 async def get_server_pub():
     return {"server_pub_b64": pubkey_to_pem_b64(SERVER_PUB)}
+
+
+# Health / Ping endpoint
+@app.get("/ping")
+async def ping():
+    """
+    Endpoint your bot can ping every 2 min to keep server alive.
+    Returns a simple status message.
+    """
+    return {"status": "ok", "message": "Server is alive"}
