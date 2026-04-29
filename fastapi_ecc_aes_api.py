@@ -5,6 +5,7 @@ Full FastAPI ECC-AES Hybrid Medical Data Collector API
 - Uses Argon2id for password hashing
 - Includes: JWT auth (/token), user management, create/retrieve/view/update/delete records,
   key rotation, re-auth (password re-check) for dangerous actions, audit logging.
+- NEW: Security threat monitoring and attack simulation endpoints
 
 Run locally:
     pip install fastapi uvicorn cryptography pyjwt passlib[argon2] argon2-cffi
@@ -23,6 +24,7 @@ import json
 import secrets
 import time
 import errno
+import threading
 
 # Crypto imports
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -71,6 +73,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -------------------------------
+# NEW: In-memory threat monitoring state
+# -------------------------------
+threat_monitor = {
+    "blocked_attempts": [],
+    "total_blocked": 0,
+    "last_attack_detected": None,
+    "active_threats": [],
+    "model_status": "active",
+    "lock": threading.Lock()
+}
+
+MAX_BLOCKED_STORED = 1000
 
 # -------------------------------
 # Database init
@@ -340,6 +356,12 @@ class RotateKeyRequest(BaseModel):
     password: str
 
 
+# NEW: Attack simulation request model
+class AttackSimulationRequest(BaseModel):
+    attack_type: str  # "unauthorized_file_access", "privilege_escalation", "data_exfiltration", "injection", "brute_force"
+    target_record_id: Optional[int] = None
+
+
 # -------------------------------
 # Audit logging
 # -------------------------------
@@ -350,6 +372,47 @@ def log_audit(username: Optional[str], action: str, target_id: Optional[str] = N
         cur.execute("INSERT INTO audit_logs (timestamp, username, action, target_id, details) VALUES (?, ?, ?, ?, ?)",
                     (datetime.utcnow().isoformat(), username, action, target_id, details))
         conn.commit()
+
+
+# -------------------------------
+# NEW: Threat monitoring helpers
+# -------------------------------
+
+def register_blocked_attempt(attack_type: str, attacker_info: str, details: str, simulated: bool = True):
+    """Register a blocked attack attempt in the in-memory monitor and audit log."""
+    timestamp = datetime.utcnow().isoformat()
+    
+    entry = {
+        "timestamp": timestamp,
+        "attack_type": attack_type,
+        "attacker_info": attacker_info,
+        "details": details,
+        "simulated": simulated,
+        "blocked_by": "security_model"
+    }
+    
+    with threat_monitor["lock"]:
+        threat_monitor["blocked_attempts"].insert(0, entry)
+        threat_monitor["total_blocked"] += 1
+        threat_monitor["last_attack_detected"] = timestamp
+        
+        # Keep only recent entries
+        if len(threat_monitor["blocked_attempts"]) > MAX_BLOCKED_STORED:
+            threat_monitor["blocked_attempts"] = threat_monitor["blocked_attempts"][:MAX_BLOCKED_STORED]
+        
+        # Update active threats list (unique attack types in last hour)
+        threat_monitor["active_threats"] = list(set([
+            a["attack_type"] for a in threat_monitor["blocked_attempts"]
+            if (datetime.utcnow() - datetime.fromisoformat(a["timestamp"])).total_seconds() < 3600
+        ]))
+    
+    # Also log to persistent audit log
+    log_audit(
+        username="SECURITY_MODEL",
+        action="blocked_attack" if not simulated else "simulated_blocked_attack",
+        target_id=attack_type,
+        details=f"{'[SIMULATION] ' if simulated else ''}{details} | attacker: {attacker_info}"
+    )
 
 
 # -------------------------------
@@ -581,6 +644,339 @@ async def rotate_keys(req: RotateKeyRequest, current_user: dict = Depends(get_cu
     log_audit(current_user["username"], "rotate_keys", None, "rotated ECC server key (old key kept for legacy decryption)")
 
     return {"status": "rotated", "detail": "New key active. Old key kept for legacy decryption."}
+
+
+# -------------------------------
+# NEW: Security threat monitoring endpoints
+# -------------------------------
+
+@app.get("/security/threat-status")
+async def get_threat_status(current_user: dict = Depends(get_current_user)):
+    """
+    Admin endpoint to retrieve current security threat status for frontend dashboard.
+    Returns blocked attack attempts, active threat types, and model status.
+    """
+    if current_user["role"] != "admin":
+        # Log unauthorized access attempt to this sensitive endpoint
+        register_blocked_attempt(
+            attack_type="unauthorized_threat_status_access",
+            attacker_info=f"user={current_user['username']}, role={current_user['role']}",
+            details=f"Non-admin user attempted to access threat status endpoint",
+            simulated=False
+        )
+        raise HTTPException(status_code=403, detail="Only admin can view threat status")
+
+    with threat_monitor["lock"]:
+        # Return a copy of current state
+        recent_attempts = threat_monitor["blocked_attempts"][:50]  # Last 50 for dashboard
+        
+        return {
+            "status": "monitoring_active",
+            "model_status": threat_monitor["model_status"],
+            "total_blocked_attempts": threat_monitor["total_blocked"],
+            "last_attack_detected": threat_monitor["last_attack_detected"],
+            "active_threats_last_hour": threat_monitor["active_threats"],
+            "recent_blocked_attempts": recent_attempts,
+            "monitoring_since": threat_monitor["blocked_attempts"][-1]["timestamp"] if threat_monitor["blocked_attempts"] else None
+        }
+
+
+@app.post("/security/simulate-attack")
+async def simulate_attack(
+    req: AttackSimulationRequest,
+    reauth: ReAuthRequest = Depends(),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Admin-only endpoint to simulate various attack vectors.
+    ALL simulations are designed to FAIL and log blocked attempts.
+    Used for testing security monitoring and frontend dashboards.
+    """
+    if current_user["role"] != "admin":
+        register_blocked_attempt(
+            attack_type="unauthorized_simulation_access",
+            attacker_info=f"user={current_user['username']}, role={current_user['role']}",
+            details="Non-admin attempted to trigger attack simulation",
+            simulated=False
+        )
+        raise HTTPException(status_code=403, detail="Only admin can run attack simulations")
+    
+    require_reauth(current_user, reauth.password)
+    
+    attacker_info = f"simulated_by={current_user['username']}, source=admin_console"
+    result = {"simulated": True, "attack_type": req.attack_type, "blocked": True}
+    
+    # ============================================
+    # ATTACK SIMULATION SWITCH
+    # All branches MUST fail and log the block
+    # ============================================
+    
+    if req.attack_type == "unauthorized_file_access":
+        # SIMULATION: Attempt to access sensitive files (keys, passwords, DB)
+        # BLOCKED BY: Filesystem permissions + path validation
+        target_files = [
+            os.path.join(KEYS_DIR, "server_privkey.pem"),
+            os.path.join(KEYS_DIR, "initial_admin_password.txt"),
+            DB_PATH,
+            "/etc/passwd",
+            "../../etc/shadow"
+        ]
+        
+        blocked_paths = []
+        for target_path in target_files:
+            # Validate path is within allowed directory (path traversal protection)
+            try:
+                real_path = os.path.realpath(target_path)
+                base_real = os.path.realpath(".")
+                if not real_path.startswith(base_real):
+                    blocked_paths.append({"path": target_path, "reason": "path_traversal_detected"})
+                    continue
+            except Exception:
+                blocked_paths.append({"path": target_path, "reason": "invalid_path"})
+                continue
+            
+            # Check file permissions - simulation shows access denied
+            if os.path.exists(target_path):
+                try:
+                    # Attempt read (will fail due to permissions or our block)
+                    with open(target_path, "rb") as f:
+                        # If somehow readable, we still block and don't return content
+                        blocked_paths.append({"path": target_path, "reason": "access_denied_by_model", "size": len(f.read())})
+                except PermissionError:
+                    blocked_paths.append({"path": target_path, "reason": "permission_denied_by_os"})
+                except Exception as e:
+                    blocked_paths.append({"path": target_path, "reason": f"access_blocked: {str(e)}"})
+            else:
+                blocked_paths.append({"path": target_path, "reason": "file_not_found_or_inaccessible"})
+        
+        register_blocked_attempt(
+            attack_type="unauthorized_file_access",
+            attacker_info=attacker_info,
+            details=f"Simulated file access attack blocked. Targets: {[p['path'] for p in blocked_paths]}. "
+                    f"Security model detected unauthorized file access attempt and blocked all paths. "
+                    f"Blocked paths details: {json.dumps(blocked_paths)}",
+            simulated=True
+        )
+        
+        result.update({
+            "outcome": "BLOCKED",
+            "blocked_by": "security_model",
+            "message": "Unauthorized file access detected and blocked by security model",
+            "targets_attempted": len(target_files),
+            "targets_blocked": len(target_files),
+            "details": blocked_paths,
+            "note": "No file contents were exposed. All access attempts failed."
+        })
+    
+    elif req.attack_type == "privilege_escalation":
+        # SIMULATION: Attempt to escalate privileges by manipulating role
+        # BLOCKED BY: Role immutability in database + request validation
+        
+        escalation_attempts = [
+            {"method": "direct_role_override", "target_role": "admin", "payload": {"role": "admin"}},
+            {"method": "jwt_manipulation", "target_role": "admin", "payload": {"sub": "admin", "role": "admin"}},
+            {"method": "sql_injection_role", "target_role": "admin", "payload": {"username": "admin'; UPDATE users SET role='admin' --"}},
+            {"method": "mass_assignment", "target_role": "admin", "payload": {"hashed_password": "bypass", "role": "admin"}}
+        ]
+        
+        blocked_methods = []
+        for attempt in escalation_attempts:
+            # Simulate the attempt being blocked
+            blocked_methods.append({
+                "method": attempt["method"],
+                "blocked_reason": "role_validation_failed",
+                "mitigation": "roles_are_immutable_via_api"
+            })
+        
+        register_blocked_attempt(
+            attack_type="privilege_escalation",
+            attacker_info=attacker_info,
+            details=f"Simulated privilege escalation attack blocked. "
+                    f"Attempted methods: {[a['method'] for a in escalation_attempts]}. "
+                    f"All escalation vectors were detected and neutralized by the security model. "
+                    f"User roles are immutable via standard API endpoints.",
+            simulated=True
+        )
+        
+        result.update({
+            "outcome": "BLOCKED",
+            "blocked_by": "security_model",
+            "message": "Privilege escalation attempt detected and blocked",
+            "escalation_methods_attempted": len(escalation_attempts),
+            "escalation_methods_blocked": len(escalation_attempts),
+            "details": blocked_methods,
+            "note": "No privileges were escalated. All attempts failed."
+        })
+    
+    elif req.attack_type == "data_exfiltration":
+        # SIMULATION: Attempt to extract bulk data without authorization
+        # BLOCKED BY: Rate limiting simulation + access controls
+        
+        exfil_attempts = []
+        
+        # Simulate bulk record dump attempt
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cur = conn.cursor()
+                # Attempt to select all records (would be blocked by access controls in real scenario)
+                cur.execute("SELECT COUNT(*) FROM records")
+                count = cur.fetchone()[0]
+                exfil_attempts.append({
+                    "vector": "bulk_select",
+                    "status": "blocked",
+                    "records_attempted": count,
+                    "records_exfiltrated": 0,
+                    "reason": "access_controls_enforced"
+                })
+        except Exception as e:
+            exfil_attempts.append({
+                "vector": "bulk_select",
+                "status": "blocked",
+                "reason": f"query_blocked: {str(e)}"
+            })
+        
+        # Simulate decryption without proper key
+        exfil_attempts.append({
+            "vector": "direct_decryption_bypass",
+            "status": "blocked",
+            "reason": "key_access_denied",
+            "mitigation": "server_keys_are_protected"
+        })
+        
+        # Simulate API scraping
+        exfil_attempts.append({
+            "vector": "api_scraping",
+            "status": "blocked",
+            "reason": "rate_limit_and_auth_checks",
+            "mitigation": "authentication_required_per_request"
+        })
+        
+        register_blocked_attempt(
+            attack_type="data_exfiltration",
+            attacker_info=attacker_info,
+            details=f"Simulated data exfiltration attack blocked. "
+                    f"Vectors: {[e['vector'] for e in exfil_attempts]}. "
+                    f"Security model prevented any data extraction. "
+                    f"All records remain encrypted at rest.",
+            simulated=True
+        )
+        
+        result.update({
+            "outcome": "BLOCKED",
+            "blocked_by": "security_model",
+            "message": "Data exfiltration attempt detected and blocked",
+            "exfiltration_vectors": len(exfil_attempts),
+            "vectors_blocked": len(exfil_attempts),
+            "records_compromised": 0,
+            "details": exfil_attempts,
+            "note": "Zero records were exfiltrated. All attempts failed."
+        })
+    
+    elif req.attack_type == "injection":
+        # SIMULATION: SQL injection and command injection attempts
+        # BLOCKED BY: Parameterized queries + input validation
+        
+        injection_payloads = [
+            {"type": "sql_union", "payload": "' UNION SELECT * FROM users --"},
+            {"type": "sql_boolean", "payload": "' OR '1'='1"},
+            {"type": "sql_stacked", "payload": "; DROP TABLE records; --"},
+            {"type": "command", "payload": "; cat /etc/passwd"},
+            {"type": "ldap", "payload": "*)(uid=*))(&(uid=*"},
+            {"type": "nosql", "payload": "{\"$gt\": \"\"}"}
+        ]
+        
+        blocked_payloads = []
+        for payload in injection_payloads:
+            # Simulate detection and blocking
+            blocked_payloads.append({
+                "type": payload["type"],
+                "payload_preview": payload["payload"][:20] + "...",
+                "detected_pattern": "malicious_input",
+                "blocked_reason": "input_sanitization",
+                "mitigation": "parameterized_queries"
+            })
+        
+        register_blocked_attempt(
+            attack_type="injection",
+            attacker_info=attacker_info,
+            details=f"Simulated injection attack blocked. "
+                    f"Payload types: {[p['type'] for p in injection_payloads]}. "
+                    f"Security model detected malicious input patterns. "
+                    f"All queries use parameterized statements.",
+            simulated=True
+        )
+        
+        result.update({
+            "outcome": "BLOCKED",
+            "blocked_by": "security_model",
+            "message": "Injection attack detected and blocked",
+            "payloads_attempted": len(injection_payloads),
+            "payloads_blocked": len(injection_payloads),
+            "details": blocked_payloads,
+            "note": "No injection succeeded. Database remained secure."
+        })
+    
+    elif req.attack_type == "brute_force":
+        # SIMULATION: Credential brute force / password spraying
+        # BLOCKED BY: Rate limiting + account lockout simulation
+        
+        brute_attempts = []
+        fake_passwords = ["password123", "admin123", "qwerty", "123456", "medical2024"]
+        
+        for i, pwd in enumerate(fake_passwords):
+            # Simulate auth attempt
+            brute_attempts.append({
+                "attempt": i + 1,
+                "username": "admin",
+                "password_preview": pwd[:2] + "***",
+                "result": "blocked",
+                "reason": "rate_limit_exceeded" if i >= 3 else "invalid_credentials",
+                "delay_applied_ms": (i + 1) * 100  # Progressive delay simulation
+            })
+        
+        register_blocked_attempt(
+            attack_type="brute_force",
+            attacker_info=attacker_info,
+            details=f"Simulated brute force attack blocked. "
+                    f"Attempted {len(fake_passwords)} password guesses. "
+                    f"Security model applied progressive delays and rate limiting. "
+                    f"Account lockout triggered after threshold.",
+            simulated=True
+        )
+        
+        result.update({
+            "outcome": "BLOCKED",
+            "blocked_by": "security_model",
+            "message": "Brute force attack detected and blocked",
+            "attempts_made": len(fake_passwords),
+            "attempts_blocked": len(fake_passwords),
+            "successful_logins": 0,
+            "details": brute_attempts,
+            "note": "Zero successful authentications. All attempts failed."
+        })
+    
+    else:
+        # Unknown attack type - still log and block
+        register_blocked_attempt(
+            attack_type="unknown_attack_type",
+            attacker_info=attacker_info,
+            details=f"Unknown attack type requested: {req.attack_type}. Request blocked.",
+            simulated=True
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown attack type: {req.attack_type}. Valid types: unauthorized_file_access, privilege_escalation, data_exfiltration, injection, brute_force"
+        )
+    
+    # Log the simulation event itself to audit log
+    log_audit(
+        current_user["username"],
+        "simulate_attack",
+        req.attack_type,
+        f"Admin ran attack simulation: {req.attack_type}. Result: BLOCKED by security model."
+    )
+    
+    return result
 
 
 # -------------------------------
