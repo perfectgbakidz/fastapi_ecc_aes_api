@@ -285,7 +285,7 @@ def ensure_initial_admin():
     
     if count == 0:
         # Generate a secure random password
-        admin_pw = "Admin2026!"
+        admin_pw = secrets.token_urlsafe(16)
         try:
             create_user("admin", admin_pw, role="admin")
             print(f"=" * 50)
