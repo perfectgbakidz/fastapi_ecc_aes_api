@@ -282,32 +282,22 @@ def ensure_initial_admin():
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM users")
         count = cur.fetchone()[0]
+    
     if count == 0:
+        # Generate a secure random password
         admin_pw = "Admin2026!"
         try:
             create_user("admin", admin_pw, role="admin")
-            print(f"Default admin account created successfully.")
+            print(f"=" * 50)
+            print(f"DEFAULT ADMIN ACCOUNT CREATED")
             print(f"Username: admin")
             print(f"Password: {admin_pw}")
+            print(f"=" * 50)
+            print(f"IMPORTANT: Change this password immediately after first login!")
         except ValueError:
             pass
 
 ensure_initial_admin()
-
-# TEMPORARY PASSWORD RESET
-with sqlite3.connect(DB_PATH) as conn:
-    cur = conn.cursor()
-
-    new_hash = pwd_context.hash("Admin2026!")
-
-    cur.execute(
-        "UPDATE users SET hashed_password = ? WHERE username = ?",
-        (new_hash, "admin")
-    )
-
-    conn.commit()
-
-    print("ADMIN PASSWORD RESET SUCCESS")
     
 def authenticate_user(username: str, password: str) -> Optional[dict]:
     user = get_user(username)
@@ -535,38 +525,30 @@ def get_record_metadata(record_id: int) -> Optional[dict]:
 async def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends()
 ):
-    print("FORM USERNAME:", repr(form_data.username))
-    print("FORM PASSWORD:", repr(form_data.password))
-
     user = get_user(form_data.username)
 
-    print("USER FOUND:", user)
-
     if not user:
-        return {
-            "error": "USER_NOT_FOUND",
-            "username": form_data.username
-        }
-
-    try:
-        verified = pwd_context.verify(
-            form_data.password,
-            user["hashed_password"]
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
-        print("PASSWORD VERIFIED:", verified)
-
-    except Exception as e:
-        print("VERIFY ERROR:", str(e))
-        return {
-            "error": "VERIFY_EXCEPTION",
-            "detail": str(e)
-        }
+    try:
+        verified = pwd_context.verify(form_data.password, user["hashed_password"])
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     if not verified:
-        return {
-            "error": "INVALID_PASSWORD"
-        }
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     access_token = create_access_token({
         "sub": user["username"],
