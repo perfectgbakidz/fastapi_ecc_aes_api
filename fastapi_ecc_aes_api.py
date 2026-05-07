@@ -294,6 +294,21 @@ def ensure_initial_admin():
 
 ensure_initial_admin()
 
+# TEMPORARY PASSWORD RESET
+with sqlite3.connect(DB_PATH) as conn:
+    cur = conn.cursor()
+
+    new_hash = pwd_context.hash("Admin2026!")
+
+    cur.execute(
+        "UPDATE users SET hashed_password = ? WHERE username = ?",
+        (new_hash, "admin")
+    )
+
+    conn.commit()
+
+    print("ADMIN PASSWORD RESET SUCCESS")
+    
 def authenticate_user(username: str, password: str) -> Optional[dict]:
     user = get_user(username)
     if not user:
