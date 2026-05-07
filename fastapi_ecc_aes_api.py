@@ -277,11 +277,12 @@ def create_user(username: str, password: str, role: str = "doctor") -> None:
         except sqlite3.IntegrityError as e:
             raise ValueError("user_exists") from e
 
-import logging
+from loguru import logger
+import sys
 
-# Set up logging that Render will capture
-logger = logging.getLogger("uvicorn")
-logger.setLevel(logging.INFO)
+# Configure loguru to output to stderr (Render captures this)
+logger.remove()  # Remove default handler
+logger.add(sys.stderr, level="INFO", format="{time} | {level} | {message}")
 
 def ensure_initial_admin():
     with sqlite3.connect(DB_PATH) as conn:
@@ -293,21 +294,28 @@ def ensure_initial_admin():
         admin_pw = secrets.token_urlsafe(16)
         try:
             create_user("admin", admin_pw, role="admin")
-            # Use logging instead of print for Render compatibility
+            # loguru will show in Render runtime logs
             logger.warning("=" * 60)
-            logger.warning("DEFAULT ADMIN CREATED - SAVE THIS PASSWORD")
-            logger.warning(f"Username: admin")
+            logger.warning("DEFAULT ADMIN ACCOUNT CREATED")
+            logger.warning("Username: admin")
             logger.warning(f"Password: {admin_pw}")
             logger.warning("=" * 60)
-            # Also write to a file Render can show
-            with open("/tmp/admin_credentials.txt", "w") as f:
-                f.write(f"Username: admin\nPassword: {admin_pw}\n")
+            logger.warning("SAVE THIS PASSWORD - IT WILL NOT BE SHOWN AGAIN")
         except ValueError:
             pass
     else:
-        logger.info("Admin already exists, skipping creation")
+        logger.info(f"Users already exist (count={count}), skipping admin creation")
 
 ensure_initial_admin()
+
+@app.on_event("startup")
+async def startup_event():
+    """Verify database state on every startup"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT username, role FROM users")
+        users = cur.fetchall()
+        logger.info(f"STARTUP: Active users: {users}")
     
 def authenticate_user(username: str, password: str) -> Optional[dict]:
     user = get_user(username)
