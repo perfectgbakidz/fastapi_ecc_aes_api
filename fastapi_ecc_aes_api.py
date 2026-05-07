@@ -285,26 +285,22 @@ logger.remove()  # Remove default handler
 logger.add(sys.stderr, level="INFO", format="{time} | {level} | {message}")
 
 def ensure_initial_admin():
+    admin_pw = os.environ.get("ADMIN_PASSWORD") or secrets.token_urlsafe(16)
+    
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM users")
-        count = cur.fetchone()[0]
+        cur.execute("DELETE FROM users WHERE username = 'admin'")
+        conn.commit()
     
-    if count == 0:
-        admin_pw = secrets.token_urlsafe(16)
-        try:
-            create_user("admin", admin_pw, role="admin")
-            # loguru will show in Render runtime logs
-            logger.warning("=" * 60)
-            logger.warning("DEFAULT ADMIN ACCOUNT CREATED")
-            logger.warning("Username: admin")
-            logger.warning(f"Password: {admin_pw}")
-            logger.warning("=" * 60)
-            logger.warning("SAVE THIS PASSWORD - IT WILL NOT BE SHOWN AGAIN")
-        except ValueError:
-            pass
-    else:
-        logger.info(f"Users already exist (count={count}), skipping admin creation")
+    try:
+        create_user("admin", admin_pw, role="admin")
+        # Only log password if it was randomly generated (not from env)
+        if os.environ.get("ADMIN_PASSWORD"):
+            logger.warning("Admin reset with password from ADMIN_PASSWORD env var")
+        else:
+            logger.warning(f"Admin reset. Random password: {admin_pw}")
+    except ValueError:
+        pass
 
 ensure_initial_admin()
 
