@@ -516,9 +516,6 @@ def get_record_metadata(record_id: int) -> Optional[dict]:
         return None
     return {"id": row[0], "created_at": row[1], "created_by": row[2], "note": row[3]}
 
-# -------------------------------
-# Token endpoint (unchanged)
-# -------------------------------
 @app.post("/token")
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     user = authenticate_user(form_data.username, form_data.password)
