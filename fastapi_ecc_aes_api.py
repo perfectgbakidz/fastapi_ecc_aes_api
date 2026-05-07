@@ -517,19 +517,52 @@ def get_record_metadata(record_id: int) -> Optional[dict]:
     return {"id": row[0], "created_at": row[1], "created_by": row[2], "note": row[3]}
 
 @app.post("/token")
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = authenticate_user(form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(status_code=400, detail="Incorrect username or password")
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    token = create_access_token({
-        "sub": user["username"], 
-        "role": user["role"], 
-        "username": user["username"]
-    }, expires_delta=access_token_expires)
-    log_audit(user["username"], "login", None, "issued JWT token")
-    return {"access_token": token, "token_type": "bearer"}
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends()
+):
+    print("FORM USERNAME:", repr(form_data.username))
+    print("FORM PASSWORD:", repr(form_data.password))
 
+    user = get_user(form_data.username)
+
+    print("USER FOUND:", user)
+
+    if not user:
+        return {
+            "error": "USER_NOT_FOUND",
+            "username": form_data.username
+        }
+
+    try:
+        verified = pwd_context.verify(
+            form_data.password,
+            user["hashed_password"]
+        )
+
+        print("PASSWORD VERIFIED:", verified)
+
+    except Exception as e:
+        print("VERIFY ERROR:", str(e))
+        return {
+            "error": "VERIFY_EXCEPTION",
+            "detail": str(e)
+        }
+
+    if not verified:
+        return {
+            "error": "INVALID_PASSWORD"
+        }
+
+    access_token = create_access_token({
+        "sub": user["username"],
+        "role": user["role"],
+        "username": user["username"]
+    })
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
 # -------------------------------
 # User management endpoints (updated with new roles)
 # -------------------------------
