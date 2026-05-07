@@ -277,6 +277,12 @@ def create_user(username: str, password: str, role: str = "doctor") -> None:
         except sqlite3.IntegrityError as e:
             raise ValueError("user_exists") from e
 
+import logging
+
+# Set up logging that Render will capture
+logger = logging.getLogger("uvicorn")
+logger.setLevel(logging.INFO)
+
 def ensure_initial_admin():
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
@@ -284,18 +290,22 @@ def ensure_initial_admin():
         count = cur.fetchone()[0]
     
     if count == 0:
-        # Generate a secure random password
         admin_pw = secrets.token_urlsafe(16)
         try:
             create_user("admin", admin_pw, role="admin")
-            print(f"=" * 50)
-            print(f"DEFAULT ADMIN ACCOUNT CREATED")
-            print(f"Username: admin")
-            print(f"Password: {admin_pw}")
-            print(f"=" * 50)
-            print(f"IMPORTANT: Change this password immediately after first login!")
+            # Use logging instead of print for Render compatibility
+            logger.warning("=" * 60)
+            logger.warning("DEFAULT ADMIN CREATED - SAVE THIS PASSWORD")
+            logger.warning(f"Username: admin")
+            logger.warning(f"Password: {admin_pw}")
+            logger.warning("=" * 60)
+            # Also write to a file Render can show
+            with open("/tmp/admin_credentials.txt", "w") as f:
+                f.write(f"Username: admin\nPassword: {admin_pw}\n")
         except ValueError:
             pass
+    else:
+        logger.info("Admin already exists, skipping creation")
 
 ensure_initial_admin()
     
