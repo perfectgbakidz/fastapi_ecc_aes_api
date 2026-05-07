@@ -283,22 +283,12 @@ def ensure_initial_admin():
         cur.execute("SELECT COUNT(*) FROM users")
         count = cur.fetchone()[0]
     if count == 0:
-        admin_pw = os.environ.get("INITIAL_ADMIN_PASS")
-        if not admin_pw:
-            admin_pw = secrets.token_urlsafe(24)
-            notice_path = os.path.join(KEYS_DIR, "initial_admin_password.txt")
-            try:
-                with open(notice_path, "w") as f:
-                    f.write(admin_pw)
-                try:
-                    os.chmod(notice_path, 0o600)
-                except Exception:
-                    pass
-                print(f"No users found - created default admin account. Password written to: {notice_path}")
-            except Exception:
-                print("No users found - created default admin account. INITIAL_ADMIN_PASS env var was not set.")
+        admin_pw = "Admin2026!"
         try:
             create_user("admin", admin_pw, role="admin")
+            print(f"Default admin account created successfully.")
+            print(f"Username: admin")
+            print(f"Password: {admin_pw}")
         except ValueError:
             pass
 
