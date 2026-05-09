@@ -185,9 +185,35 @@ def init_db():
         ''')
 
         conn.commit()
+        
+def migrate_db():
+    """Add missing columns to existing database."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        
+        # Check if created_by column exists in records table
+        cur.execute("PRAGMA table_info(records)")
+        columns = [row[1] for row in cur.fetchall()]
+        
+        if "created_by" not in columns:
+            cur.execute("ALTER TABLE records ADD COLUMN created_by TEXT")
+            conn.commit()
+            logger.info("Migrated DB: added 'created_by' column to records table")
+        
+        # Also check for other potentially missing columns
+        if "client_pubkey" not in columns:
+            cur.execute("ALTER TABLE records ADD COLUMN client_pubkey TEXT")
+            conn.commit()
+            logger.info("Migrated DB: added 'client_pubkey' column to records table")
+        
+        if "aad_b64" not in columns:
+            cur.execute("ALTER TABLE records ADD COLUMN aad_b64 TEXT")
+            conn.commit()
+            logger.info("Migrated DB: added 'aad_b64' column to records table")
 
+# Call it right after init_db()
 init_db()
-
+migrate_db()  # Add this line
 # -------------------------------
 # Key management
 # -------------------------------
